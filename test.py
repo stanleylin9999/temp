@@ -26,6 +26,7 @@ def create_cloth_mesh(
     length=0.3,
     rows=12,
     cols=12,
+    
 ):
     """建立自訂 3D 布料網格並套用 PhysX Particle Cloth 物理特性"""
     mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(prim_path))
@@ -50,7 +51,7 @@ def create_cloth_mesh(
 
     # 布料懸空放置在水槽上方 (Z = 0.52m)
     xform = UsdGeom.Xformable(mesh)
-    xform.AddTranslateOp().Set(Gf.Vec3f(0.0, 0.0, 0.52))
+    xform.AddTranslateOp().Set(Gf.Vec3f(0.19, 0.15175, 0.73))
 
     mesh.CreateDisplayColorAttr().Set(
         Vt.Vec3fArray([Gf.Vec3f(0.95, 0.95, 0.95)])
@@ -198,18 +199,28 @@ def main():
     # --------------------------------------------------------------------------
     # 5. 生成布料與加載 SO-ARM101-USD.usd
     # --------------------------------------------------------------------------
+    
     print("[INFO] 3/5 生成布料與配置 SO-ARM101 機械手臂...")
     cloth_mesh, cloth_mass_api = create_cloth_mesh(
         stage, particle_system_path, "/World/ClothMesh"
     )
 
+    arm_position = np.array([0.75, 0.25, 0.5])
     so_arm101_usd_path = "C:/Users/702A/Desktop/SO-ARM101-USD.usd"
     add_reference_to_stage(usd_path=so_arm101_usd_path, prim_path="/World/SO_ARM101")
+
+    # 方法 A：直接在 USD Stage 級別修正頂層 Prim 的 Translation
+    arm_prim = stage.GetPrimAtPath("/World/SO_ARM101")
+    if arm_prim.IsValid():
+        xform = UsdGeom.Xformable(arm_prim)
+        xform.ClearXformOpOrder()  # 清除舊的變換矩陣，避免衝突
+        xform.AddTranslateOp().Set(Gf.Vec3f(0.75, 0.25, 0.5))
+        xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, -90.0))
 
     arm_robot = Robot(
         prim_path="/World/SO_ARM101",
         name="so_arm101",
-        position=np.array([0.48, 0.0, 0.0]),
+        position=arm_position,
         orientation=np.array([1.0, 0.0, 0.0, 0.0]),
     )
     world.scene.add(arm_robot)
@@ -230,6 +241,7 @@ def main():
     max_wet_mass = 0.35
     current_mass = dry_mass
     water_surface_z = 0.45
+    cloth_init_z = 0.73
 
     while simulation_app.is_running():
         world.step(render=True)

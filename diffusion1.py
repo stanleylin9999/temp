@@ -16,21 +16,20 @@ from torch.utils.data import Dataset, DataLoader
 # =========================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DIFFUSION_STEPS = 100
-MC_SAMPLES = 16           # 蒙地卡羅期望值採樣次數
+MC_SAMPLES = 16           # 蒙地卡羅採樣次數 (求期望值降低 NRMSE)
 BATCH_SIZE = 16
 EPOCHS = 100
 LR = 1e-3
-COND_DROPOUT_PROB = 0.15  # 條件隨機丟棄
-SPARSITY_THRESH = 0.015   # 跨區轉移矩陣微小機率截斷門檻
+COND_DROPOUT_PROB = 0.15  # 條件隨機丟棄率
+SPARSITY_THRESH = 0.015   # 跨區轉移微小機率截斷門檻
 
-# 官方最新正規化分母
+# 官方最新正規化常數
 NORM_DIAG = 26.57
 NORM_OFFDIAG = 0.0176
 
-EQ_DATE = pd.to_datetime("2024-01-01")
-EVAL_GAP_START = pd.to_datetime("2024-02-01")
-EVAL_GAP_END = pd.to_datetime("2024-03-31")
 PRED_START = pd.to_datetime("2024-01-01")
+EVAL_GAP_START = pd.to_datetime("2024-02-01") # 2~3 月缺測補全區間
+EVAL_GAP_END = pd.to_datetime("2024-03-31")
 PRED_END = pd.to_datetime("2024-10-31")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
@@ -39,7 +38,7 @@ SPECIFIC_CLASS_DIR = r"C:\Users\User\Desktop\人口預測專案\人口預測專�
 FALLBACK_CLASS_DIR = os.path.join(SCRIPT_DIR, "humob2026", "data", "output", "module05", "classification", "by_class")
 BY_CLASS_DIR = SPECIFIC_CLASS_DIR if os.path.exists(SPECIFIC_CLASS_DIR) else FALLBACK_CLASS_DIR
 
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "humob_preeq_diffusion_output")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "humob_robust_diffusion_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 CLASS_INFO_MAP = {
@@ -55,7 +54,7 @@ CLASS_INFO_MAP = {
 }
 
 # =========================================================================
-# 2. 資料解析與解耦
+# 2. 資料解析與離群值過濾工具
 # =========================================================================
 def get_class_id_from_filename(fname: str) -> int:
     fname = fname.lower()
@@ -69,6 +68,16 @@ def get_class_id_from_filename(fname: str) -> int:
     if "partial_dissipation" in fname or "dissip" in fname: return 8
     if "persistent_increase" in fname or "increase" in fname: return 9
     return None
+
+def robust_median(df_sub):
+    """使用 IQR 截斷法剔除離群值後計算中位數"""
+    q25 = df_sub.quantile(0.25)
+    q75 = df_sub.quantile(0.75)
+    iqr = q75 - q25
+    lower_bound = q25 - 1.5 * iqr
+    upper_bound = q75 + 1.5 * iqr
+    clipped = df_sub.clip(lower=lower_bound, upper=upper_bound, axis=1)
+    return clipped.median(axis=0).fillna(0.0)
 
 def load_and_split_flows():
     print("[1/5] 解析 9 大類別與 TSV (分離對角線與非對角線流量)...")
@@ -121,107 +130,123 @@ def load_and_split_flows():
     return diag_df[valid_grids], offdiag_df[valid_grids], daily_od_records, valid_grids, grid_class_lookup
 
 # =========================================================================
-# 3. 模組一：震後長期回復函數 (決定 2~3 月波形平均位置)
+# 3. 模組一：去離群值類別自適應先驗引擎 (Robust Category Bridge)
 # =========================================================================
-class PostEarthquakeRecoveryEngine:
+class RobustCategoryBridgePrior:
     def __init__(self, flow_df, grid_class_lookup, valid_grids):
         self.flow_df = flow_df
         self.grid_class_lookup = grid_class_lookup
         self.valid_grids = valid_grids
         
-        pre_mask = flow_df.index < PRED_START
-        self.M_pre = flow_df.loc[pre_mask, valid_grids].median().clip(lower=1.0)
+        # 1. 震前常態基準 (去離群值)
+        pre_df = flow_df.loc[flow_df.index < PRED_START, valid_grids]
+        self.M_pre = robust_median(pre_df).clip(lower=1.0)
         
-        # 1 月底 (Left Anchor) 與 4 月初 (Right Anchor)
-        jan_tail = flow_df.loc["2024-01-25":"2024-01-31", valid_grids]
-        self.l_left = jan_tail.median().fillna(self.M_pre).clip(lower=0.0)
+        # 2. 1 月底左錨點 (剔除震後初期離群值)
+        jan_tail = flow_df.loc["2024-01-20":"2024-01-31", valid_grids]
+        self.l_left = robust_median(jan_tail).clip(lower=0.0)
         
-        right_sub = flow_df.loc["2024-04-01":"2024-04-07", valid_grids] if "2024-04-01" in flow_df.index else jan_tail
-        self.l_right = right_sub.median().fillna(self.l_left).clip(lower=0.0)
+        # 3. 4 月初右錨點 (真實復原起點)
+        if "2024-04-01" in flow_df.index:
+            right_sub = flow_df.loc["2024-04-01":"2024-04-14", valid_grids]
+        else:
+            right_sub = flow_df.loc["2024-05-01":"2024-05-14", valid_grids] if "2024-05-01" in flow_df.index else jan_tail
+        self.l_right = robust_median(right_sub).clip(lower=0.0)
 
-    def compute_recovery_seed(self, dt):
-        """計算在日期 dt 的宏觀平均回復人數 (種子位準)"""
+    def compute_robust_seed(self, dt):
+        """根據 9 大類別的真實物理行為生成無斷層平滑種子"""
         if dt < EVAL_GAP_START:
             if dt in self.flow_df.index:
                 return self.flow_df.loc[dt, self.valid_grids].values
             return self.l_left.values
+            
         elif dt <= EVAL_GAP_END:
             gap_days = (EVAL_GAP_END - EVAL_GAP_START).days + 1
             tau = min(1.0, max(0.0, ((dt - EVAL_GAP_START).days + 1) / gap_days))
+            
+            # Smoothstep (Hermite) S-Curve 確保邊界一階導數為 0，絕無斷崖
             s_curve = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
             mu_t = self.l_left + s_curve * (self.l_right - self.l_left)
             
-            # 各類別形態微調
             for g in self.valid_grids:
                 c = self.grid_class_lookup.get(g, 0)
-                if c == 3:   # 避難聚集
-                    mu_t[g] += np.sin(np.pi * tau) * 0.30 * self.l_left[g]
-                elif c == 7: # 激增消散
-                    mu_t[g] = self.l_left[g] + (1.0 - np.exp(-3.0 * tau)) * (self.l_right[g] - self.l_left[g])
-                elif c == 4: # 部分復原凸曲線
-                    mu_t[g] = self.l_left[g] + (tau ** 2.0) * (self.l_right[g] - self.l_left[g])
-                elif c == 1: # Persistent Zero
+                
+                # Class 01: 持續為 0
+                if c == 1:
                     mu_t[g] = 0.0
-            return mu_t.values
+                
+                # Class 02: 持續減少區，維持低位平滑過渡 (以 1 月底和 4 月初為界，不往震前高位拉)
+                elif c == 2:
+                    mu_t[g] = self.l_left[g] + s_curve * (self.l_right[g] - self.l_left[g])
+                
+                # Class 03: 避難活動區，由 1 月底平滑回落至 4 月初常態水準 (去除假波峰)
+                elif c == 3:
+                    dissip = 1.0 - np.exp(-3.0 * tau)
+                    mu_t[g] = self.l_left[g] + dissip * (self.l_right[g] - self.l_left[g])
+                    
+                # Class 04: 部分復原，凸曲線加速修復
+                elif c == 4:
+                    mu_t[g] = self.l_left[g] + (tau ** 2.0) * (self.l_right[g] - self.l_left[g])
+                    
+                # Class 07: 激增平滑消散
+                elif c == 7:
+                    dissip = 1.0 - np.exp(-3.0 * tau)
+                    mu_t[g] = self.l_left[g] + dissip * (self.l_right[g] - self.l_left[g])
+                    
+            return np.maximum(0.0, mu_t.values)
         else:
             if dt in self.flow_df.index:
                 return self.flow_df.loc[dt, self.valid_grids].values
             return self.l_right.values
 
 # =========================================================================
-# 4. 模組二：震前常態波型資料集 (純震前資料訓練)
+# 4. 模組二：波型生成函數 (雙條件擴散模型：在震前常態資料訓練)
 # =========================================================================
-def extract_calendar_slice(dt):
+def extract_calendar_features(dt):
     dow = dt.dayofweek
     return np.array([
         np.sin(2 * np.pi * dow / 7.0),
         np.cos(2 * np.pi * dow / 7.0),
-        1.0 if dow < 5 else 0.0,            # 工作日
-        1.0 if dow in [5, 6] else 0.0,       # 週末
+        1.0 if dow < 5 else 0.0,            # 上班/工作日規律
+        1.0 if dow in [5, 6] else 0.0,       # 週末規律
         np.sin(2 * np.pi * dt.day / 31.0),
         np.cos(2 * np.pi * dt.day / 31.0)
     ], dtype=np.float32)
 
-class PreEarthquakeWaveformDataset(Dataset):
-    """只使用震前 (2024-01-01 以前) 的常態歷史資料建立波型先驗分佈"""
+class PreEQWaveformDataset(Dataset):
     def __init__(self, flow_df, valid_grids, max_ceiling):
         self.samples = []
         self.max_ceiling = max_ceiling
-        
-        # 嚴格過濾：僅使用震前資料
         pre_dates = [dt for dt in flow_df.index if dt < PRED_START]
-        self.M_pre = flow_df.loc[pre_dates, valid_grids].median().values
+        self.M_pre = robust_median(flow_df.loc[pre_dates, valid_grids]).values
         
         raw_res, raw_seeds, raw_times = [], [], []
         for dt in pre_dates:
             y_true = np.nan_to_num(flow_df.loc[dt, valid_grids].values, nan=0.0)
-            seed = self.M_pre.copy() # 震前基準水平
-            time_slice = extract_calendar_slice(dt)
+            seed = self.M_pre.copy()
+            time_feat = extract_calendar_features(dt)
             
             raw_res.append(y_true - seed)
             raw_seeds.append(seed)
-            raw_times.append(time_slice)
+            raw_times.append(time_feat)
             
         raw_res = np.array(raw_res)
         self.scale = np.std(raw_res, axis=0)
         self.scale = np.where(self.scale < 1.0, 1.0, self.scale)
         
-        for res, seed, t_slice in zip(raw_res, raw_seeds, raw_times):
+        for res, seed, t_feat in zip(raw_res, raw_seeds, raw_times):
             norm_res = np.nan_to_num(res / self.scale, nan=0.0)
             norm_seed = np.nan_to_num(seed / (self.max_ceiling + 1e-4), nan=0.0)
-            self.samples.append((norm_res, norm_seed, t_slice))
+            self.samples.append((norm_res, norm_seed, t_feat))
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
-        res, n_seed, t_slice = self.samples[idx]
+        res, n_seed, t_feat = self.samples[idx]
         return (torch.tensor(res, dtype=torch.float32), 
                 torch.tensor(n_seed, dtype=torch.float32), 
-                torch.tensor(t_slice, dtype=torch.float32))
+                torch.tensor(t_feat, dtype=torch.float32))
 
-# =========================================================================
-# 5. 模組三：去噪擴散網路架構
-# =========================================================================
-class PureWaveformDenoiser(nn.Module):
+class RobustWaveformDenoiser(nn.Module):
     def __init__(self, num_nodes, time_dim=6, hidden_dim=128):
         super().__init__()
         self.num_nodes = num_nodes
@@ -237,7 +262,6 @@ class PureWaveformDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 64)
         )
-        
         self.in_proj = nn.Linear(num_nodes, hidden_dim)
         self.res1 = nn.Sequential(
             nn.Linear(hidden_dim + 128, hidden_dim),
@@ -259,13 +283,13 @@ class PureWaveformDenoiser(nn.Module):
         args = timesteps[:, None].float() * freqs[None]
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
-    def forward(self, x_noisy, t_step, norm_seed, time_slice, drop_mask=None):
+    def forward(self, x_noisy, t_step, norm_seed, time_feat, drop_mask=None):
         t_emb = self.step_mlp(self._get_timestep_embedding(t_step, 64))
         if drop_mask is not None:
             norm_seed = norm_seed * drop_mask
-            time_slice = time_slice * drop_mask
+            time_feat = time_feat * drop_mask
             
-        c_in = self.cond_norm(torch.cat([norm_seed, time_slice], dim=-1))
+        c_in = self.cond_norm(torch.cat([norm_seed, time_feat], dim=-1))
         c_emb = self.cond_mlp(c_in)
         ctx = torch.cat([t_emb, c_emb], dim=-1)
         
@@ -290,35 +314,35 @@ class DualDiffusionEngine:
         return self.sqrt_alphas_cumprod[t].unsqueeze(-1) * x_0 + self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1) * noise, noise
 
     @torch.no_grad()
-    def p_sample(self, model, x_t, t, norm_seed, time_slice):
+    def p_sample(self, model, x_t, t, norm_seed, time_feat):
         betas_t = self.betas[t].unsqueeze(-1)
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
         sqrt_recip = torch.sqrt(1.0 / self.alphas[t]).unsqueeze(-1)
         
-        pred_eps = model(x_t, t, norm_seed, time_slice)
+        pred_eps = model(x_t, t, norm_seed, time_feat)
         mean = sqrt_recip * (x_t - (betas_t / sqrt_one_minus) * pred_eps)
         if (t == 0).all(): return mean
         return mean + torch.sqrt(self.posterior_var[t].unsqueeze(-1)) * torch.randn_like(x_t)
 
     @torch.no_grad()
-    def sample_monte_carlo(self, model, norm_seed, time_slice, k_samples=MC_SAMPLES):
+    def sample_monte_carlo(self, model, norm_seed, time_feat, k_samples=MC_SAMPLES):
         b, dim = norm_seed.shape[0], model.num_nodes
         accum = torch.zeros(b, dim, device=DEVICE)
         for _ in range(k_samples):
             x_t = torch.randn(b, dim, device=DEVICE)
             for step in reversed(range(self.timesteps)):
                 t_tensor = torch.full((b,), step, device=DEVICE, dtype=torch.long)
-                x_t = self.p_sample(model, x_t, t_tensor, norm_seed, time_slice)
+                x_t = self.p_sample(model, x_t, t_tensor, norm_seed, time_feat)
             accum += x_t
         return torch.clamp(accum / k_samples, -2.5, 2.5)
 
 # =========================================================================
-# 6. 主管線流程
+# 5. 主程式管線
 # =========================================================================
 def main():
     print("=" * 80)
-    print("🚀 HuMob 2026：純震前常態波型訓練 ＋ 長期回復種子 (Seed) 遷移生成")
-    print(f"🎯 評測正規化標準: Diag / {NORM_DIAG} | Off-Diag / {NORM_OFFDIAG}")
+    print("🚀 HuMob 2026：去離群值類別自適應先驗 ＋ 震前常態波型雙擴散生成")
+    print(f"🎯 正規化標準: Diag / {NORM_DIAG} | Off-Diag / {NORM_OFFDIAG}")
     print("=" * 80)
 
     # 1. 載入資料
@@ -330,38 +354,37 @@ def main():
     max_ceiling_diag = diag_df.loc[pre_mask, valid_grids].quantile(0.99).fillna(50.0).values * 1.5 + 5.0
     max_ceiling_offdiag = offdiag_df.loc[pre_mask, valid_grids].quantile(0.99).fillna(20.0).values * 1.5 + 5.0
 
-    # 2. 建立純震前資料載入器
-    diag_ds = PreEarthquakeWaveformDataset(diag_df, valid_grids, max_ceiling_diag)
-    offdiag_ds = PreEarthquakeWaveformDataset(offdiag_df, valid_grids, max_ceiling_offdiag)
+    # 2. 建立去離群值先驗引擎
+    prior_diag = RobustCategoryBridgePrior(diag_df, grid_class_lookup, valid_grids)
+    prior_offdiag = RobustCategoryBridgePrior(offdiag_df, grid_class_lookup, valid_grids)
+
+    # 3. 建立震前常態波型資料載入器
+    diag_ds = PreEQWaveformDataset(diag_df, valid_grids, max_ceiling_diag)
+    offdiag_ds = PreEQWaveformDataset(offdiag_df, valid_grids, max_ceiling_offdiag)
     
     diag_loader = DataLoader(diag_ds, batch_size=BATCH_SIZE, shuffle=True)
     offdiag_loader = DataLoader(offdiag_ds, batch_size=BATCH_SIZE, shuffle=True)
-    print(f"✓ 震前常態訓練樣本數: {len(diag_ds)} 天")
 
-    # 3. 建立災後長期回復函數引擎
-    rec_engine_diag = PostEarthquakeRecoveryEngine(diag_df, grid_class_lookup, valid_grids)
-    rec_engine_offdiag = PostEarthquakeRecoveryEngine(offdiag_df, grid_class_lookup, valid_grids)
-
-    # 4. 訓練 Model 1 (對角線常態波型) 與 Model 2 (非對角線常態波型)
+    # 4. 訓練 Model 1 (對角線波型) 與 Model 2 (非對角線波型)
     diff_engine = DualDiffusionEngine(DIFFUSION_STEPS)
-    model_diag = PureWaveformDenoiser(num_nodes=num_nodes).to(DEVICE)
-    model_offdiag = PureWaveformDenoiser(num_nodes=num_nodes).to(DEVICE)
+    model_diag = RobustWaveformDenoiser(num_nodes=num_nodes).to(DEVICE)
+    model_offdiag = RobustWaveformDenoiser(num_nodes=num_nodes).to(DEVICE)
 
     opt_diag = optim.AdamW(model_diag.parameters(), lr=LR, weight_decay=1e-4)
     opt_offdiag = optim.AdamW(model_offdiag.parameters(), lr=LR, weight_decay=1e-4)
     criterion = nn.MSELoss()
 
-    print("\n[2/5] 在震前常態資料上訓練對角線留存波型模型 (Diag Pre-EQ)...")
+    print("\n[2/5] 訓練對角線留存波型模型 (Diag Pre-EQ)...")
     model_diag.train()
     for ep in range(1, EPOCHS + 1):
         total_loss = 0.0
-        for res, n_seed, t_slice in diag_loader:
-            res, n_seed, t_slice = res.to(DEVICE), n_seed.to(DEVICE), t_slice.to(DEVICE)
+        for res, n_seed, t_feat in diag_loader:
+            res, n_seed, t_feat = res.to(DEVICE), n_seed.to(DEVICE), t_feat.to(DEVICE)
             t = torch.randint(0, diff_engine.timesteps, (res.shape[0],), device=DEVICE).long()
             x_noisy, noise = diff_engine.q_sample(res, t)
             
             drop_mask = (torch.rand(res.shape[0], 1, device=DEVICE) > COND_DROPOUT_PROB).float()
-            pred_noise = model_diag(x_noisy, t, n_seed, t_slice, drop_mask)
+            pred_noise = model_diag(x_noisy, t, n_seed, t_feat, drop_mask)
             
             loss = criterion(pred_noise, noise)
             opt_diag.zero_grad()
@@ -370,19 +393,19 @@ def main():
             opt_diag.step()
             total_loss += loss.item()
         if ep % 30 == 0 or ep == EPOCHS:
-            print(f"  Epoch [{ep:03d}/{EPOCHS}] - Diag Pre-EQ Loss: {total_loss / len(diag_loader):.6f}")
+            print(f"  Epoch [{ep:03d}/{EPOCHS}] - Diag Loss: {total_loss / len(diag_loader):.6f}")
 
-    print("\n[3/5] 在震前常態資料上訓練非對角線跨區波型模型 (Off-Diag Pre-EQ)...")
+    print("\n[3/5] 訓練非對角線跨區波型模型 (Off-Diag Pre-EQ)...")
     model_offdiag.train()
     for ep in range(1, EPOCHS + 1):
         total_loss = 0.0
-        for res, n_seed, t_slice in offdiag_loader:
-            res, n_seed, t_slice = res.to(DEVICE), n_seed.to(DEVICE), t_slice.to(DEVICE)
+        for res, n_seed, t_feat in offdiag_loader:
+            res, n_seed, t_feat = res.to(DEVICE), n_seed.to(DEVICE), t_feat.to(DEVICE)
             t = torch.randint(0, diff_engine.timesteps, (res.shape[0],), device=DEVICE).long()
             x_noisy, noise = diff_engine.q_sample(res, t)
             
             drop_mask = (torch.rand(res.shape[0], 1, device=DEVICE) > COND_DROPOUT_PROB).float()
-            pred_noise = model_offdiag(x_noisy, t, n_seed, t_slice, drop_mask)
+            pred_noise = model_offdiag(x_noisy, t, n_seed, t_feat, drop_mask)
             
             loss = criterion(pred_noise, noise)
             opt_offdiag.zero_grad()
@@ -391,10 +414,10 @@ def main():
             opt_offdiag.step()
             total_loss += loss.item()
         if ep % 30 == 0 or ep == EPOCHS:
-            print(f"  Epoch [{ep:03d}/{EPOCHS}] - Off-Diag Pre-EQ Loss: {total_loss / len(offdiag_loader):.6f}")
+            print(f"  Epoch [{ep:03d}/{EPOCHS}] - Off-Diag Loss: {total_loss / len(offdiag_loader):.6f}")
 
-    # 5. 結合回復函數 (Seed) 與擴散模型生成 2~3 月補全
-    print("\n[4/5] 結合回復位準 (Seed) 與擴散模型生成 2~3 月補全波型...")
+    # 5. 生成 2~3 月補全 (去離群值先驗種子 + 擴散波型)
+    print("\n[4/5] 結合自適應種子與擴散波型生成 2~3 月人流 (修復 Class 2 & 3)...")
     model_diag.eval()
     model_offdiag.eval()
     
@@ -407,21 +430,18 @@ def main():
                 pred_diag_flows[dt] = diag_df.loc[dt, valid_grids].copy()
                 pred_offdiag_flows[dt] = offdiag_df.loc[dt, valid_grids].copy()
             else:
-                # 1. 回復函數提供宏觀水位 Seed
-                seed_d = rec_engine_diag.compute_recovery_seed(dt)
-                seed_o = rec_engine_offdiag.compute_recovery_seed(dt)
+                seed_d = prior_diag.compute_robust_seed(dt)
+                seed_o = prior_offdiag.compute_robust_seed(dt)
                 
                 n_seed_d = torch.tensor(seed_d / (max_ceiling_diag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
                 n_seed_o = torch.tensor(seed_o / (max_ceiling_offdiag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
-                t_slice = torch.tensor(extract_calendar_slice(dt), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                t_feat = torch.tensor(extract_calendar_features(dt), dtype=torch.float32).unsqueeze(0).to(DEVICE)
                 
-                # 2. 擴散模型生成常態週期通勤波動
-                res_d = diff_engine.sample_monte_carlo(model_diag, n_seed_d, t_slice).squeeze(0).cpu().numpy() * diag_ds.scale
-                # 依水位按比例縮放波動幅度 (避免低水位時波動過大)
+                res_d = diff_engine.sample_monte_carlo(model_diag, n_seed_d, t_feat).squeeze(0).cpu().numpy() * diag_ds.scale
                 level_ratio_d = np.clip(seed_d / (diag_ds.M_pre + 1e-4), 0.1, 1.2)
                 res_d = res_d * level_ratio_d
 
-                res_o = diff_engine.sample_monte_carlo(model_offdiag, n_seed_o, t_slice).squeeze(0).cpu().numpy() * offdiag_ds.scale
+                res_o = diff_engine.sample_monte_carlo(model_offdiag, n_seed_o, t_feat).squeeze(0).cpu().numpy() * offdiag_ds.scale
                 level_ratio_o = np.clip(seed_o / (offdiag_ds.M_pre + 1e-4), 0.1, 1.2)
                 res_o = res_o * level_ratio_o
                 
@@ -436,7 +456,7 @@ def main():
                 pred_diag_flows[dt] = pd.Series(final_d, index=valid_grids)
                 pred_offdiag_flows[dt] = pd.Series(final_o, index=valid_grids)
 
-    # 6. 稀疏化評估與 NRMSE
+    # 6. 稀疏化跨區轉移矩陣與 NRMSE 評估
     print("\n[5/5] 計算最新官方 Combined NRMSE...")
     hist_off_prob = {g: {} for g in valid_grids}
     for dt in diag_df.loc[pre_mask].index:
@@ -491,7 +511,7 @@ def main():
     print(f"🔹 Mean RMSE (Off-Diag):           {m_off:8.4f}")
     print(f"🔸 NRMSE (Diag)     [/{NORM_DIAG}]:    {n_diag:8.4f}")
     print(f"🔸 NRMSE (Off-Diag) [/{NORM_OFFDIAG}]:  {n_off:8.4f}")
-    print(f"🏆 Pre-EQ Diffusion Combined NRMSE: {combined_nrmse:8.4f}")
+    print(f"🏆 Robust Dual-Diffusion NRMSE:    {combined_nrmse:8.4f}")
     print("-" * 75)
 
     # 7. 匯出 CSV 與繪製 9 大類別圖譜
@@ -504,7 +524,7 @@ def main():
     plt.style.use('dark_background')
     fig, axes = plt.subplots(3, 3, figsize=(19, 11.5), dpi=250)
     fig.patch.set_facecolor('#0f172a')
-    fig.suptitle(f'HuMob 2026: Pre-EQ Diffusion + Recovery Seed across 9 Classes | NRMSE: {combined_nrmse:.4f}', 
+    fig.suptitle(f'HuMob 2026: Robust Category Diffusion (Fixed Class 2 & 3) | NRMSE: {combined_nrmse:.4f}', 
                  fontsize=14, fontweight='bold', color='#ffffff', y=0.98)
 
     pre_gap_mask = total_truth_df.index < EVAL_GAP_START
@@ -530,7 +550,7 @@ def main():
         ax.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.15, label='Feb-Mar Gap' if c_id == 1 else "")
         ax.plot(actual_pre.index, actual_pre, color='#f43f5e', linewidth=1.2, label='Ground Truth' if c_id == 1 else "")
         ax.plot(actual_post.index, actual_post, color='#f43f5e', linewidth=1.2)
-        ax.plot(pred_line.index, pred_line, color='#10b981', linewidth=1.4, linestyle='--', label='Pre-EQ Diffusion Pred' if c_id == 1 else "")
+        ax.plot(pred_line.index, pred_line, color='#10b981', linewidth=1.4, linestyle='--', label='Robust Diffusion Pred' if c_id == 1 else "")
 
         ax.set_title(f"{CLASS_INFO_MAP[c_id]} (N={len(c_grids)})", fontsize=10, fontweight='bold', color='#f8fafc', pad=6)
         ax.grid(True, color='#334155', linestyle=':', alpha=0.5)
@@ -542,10 +562,10 @@ def main():
                fontsize=10, frameon=True, facecolor='#1e293b', edgecolor='#475569')
     plt.tight_layout(rect=[0, 0.04, 1, 0.96])
     
-    chart_path = os.path.join(OUTPUT_DIR, "all_9classes_preeq_diffusion_overview.png")
+    chart_path = os.path.join(OUTPUT_DIR, "all_9classes_robust_diffusion.png")
     plt.savefig(chart_path, dpi=250, bbox_inches='tight')
     plt.close(fig)
-    print(f"✓ 圖表已存檔至: {chart_path}")
+    print(f"✓ 已修復 Class 2 與 3 之 9 大類別圖譜輸出完成：{chart_path}")
 
 if __name__ == "__main__":
     main()
